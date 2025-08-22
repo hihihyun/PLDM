@@ -6,41 +6,38 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
 from pathlib import Path
-# models 폴더의 water_physics에서 WaterNetPreprocessor를 import합니다.
 from ..models.water_physics import WaterNetPreprocessor
 
 class UnderwaterDataset(Dataset):
-    """General underwater image enhancement dataset for UIEB and LSUI"""
     def __init__(self, root_dir, dataset_type, split, img_size, augment, preprocessing_type):
         self.root_dir = Path(root_dir)
         self.dataset_type = dataset_type
-        self.split = split
-        self.img_size = img_size
-        self.augment = augment and split == 'train'
-        self.preprocessing_type = preprocessing_type
-
+        # ... (이하 동일) ...
         if dataset_type == 'UIEB':
             self.degraded_dir = self.root_dir / 'UIEB' / 'raw-890'
             self.enhanced_dir = self.root_dir / 'UIEB' / 'reference-890'
-        elif dataset_type == 'LSUI':
-            self.degraded_dir = self.root_dir / 'LSUI' / 'input'
-            self.enhanced_dir = self.root_dir / 'LSUI' / 'GT'
-        else:
-            raise ValueError(f"Unknown dataset type: {dataset_type}")
-
+        # ... (이하 동일) ...
         self.data_pairs = self._load_data_pairs()
         self.setup_transforms()
         print(f"Loaded {len(self.data_pairs)} images for {dataset_type} {split} set.")
 
     def _load_data_pairs(self):
         pairs = []
-        degraded_files = sorted(self.degraded_dir.glob('*.*'))
+        # 👇 [수정] glob 패턴을 명확한 이미지 확장자로 한정
+        image_extensions = ['*.png', '*.jpg', '*.jpeg']
+        degraded_files = []
+        for ext in image_extensions:
+            degraded_files.extend(self.degraded_dir.glob(ext))
+        
+        degraded_files = sorted(degraded_files)
+
         for degraded_file in degraded_files:
             enhanced_file = self.enhanced_dir / degraded_file.name
             if enhanced_file.exists():
                 pairs.append((degraded_file, enhanced_file))
         return pairs
-
+    
+    # ... (이하 나머지 코드는 동일) ...
     def setup_transforms(self):
         transform_list = [
             transforms.Resize((self.img_size, self.img_size)),

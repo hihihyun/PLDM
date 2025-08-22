@@ -12,18 +12,27 @@ class UnderwaterDataset(Dataset):
     def __init__(self, root_dir, dataset_type, split, img_size, augment, preprocessing_type):
         self.root_dir = Path(root_dir)
         self.dataset_type = dataset_type
-        # ... (이하 동일) ...
+        self.split = split
+        self.img_size = img_size
+        self.augment = augment and split == 'train'
+        self.preprocessing_type = preprocessing_type
+
         if dataset_type == 'UIEB':
             self.degraded_dir = self.root_dir / 'UIEB' / 'raw-890'
             self.enhanced_dir = self.root_dir / 'UIEB' / 'reference-890'
-        # ... (이하 동일) ...
+        elif dataset_type == 'LSUI':
+            self.degraded_dir = self.root_dir / 'LSUI' / 'input'
+            self.enhanced_dir = self.root_dir / 'LSUI' / 'GT'
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
+
         self.data_pairs = self._load_data_pairs()
         self.setup_transforms()
         print(f"Loaded {len(self.data_pairs)} images for {dataset_type} {split} set.")
 
     def _load_data_pairs(self):
         pairs = []
-        # 👇 [수정] glob 패턴을 명확한 이미지 확장자로 한정
+        # 👇 [수정 완료] glob 패턴을 명확한 이미지 확장자로 한정
         image_extensions = ['*.png', '*.jpg', '*.jpeg']
         degraded_files = []
         for ext in image_extensions:
@@ -37,7 +46,6 @@ class UnderwaterDataset(Dataset):
                 pairs.append((degraded_file, enhanced_file))
         return pairs
     
-    # ... (이하 나머지 코드는 동일) ...
     def setup_transforms(self):
         transform_list = [
             transforms.Resize((self.img_size, self.img_size)),
@@ -65,8 +73,9 @@ class UnderwaterDataset(Dataset):
         result = {'degraded': degraded, 'enhanced': enhanced}
 
         if self.preprocessing_type == 'waternet':
-            # unsqueeze/squeeze to create a batch of 1 for the preprocessor
-            preprocessed_tensor = WaterNetPreprocessor.preprocess_batch(degraded.unsqueeze(0)).squeeze(0)
+            # [-1, 1] 범위를 [0, 1] 범위로 되돌린 후 전처리
+            degraded_for_preprocess = (degraded * 0.5) + 0.5
+            preprocessed_tensor = WaterNetPreprocessor.preprocess_batch(degraded_for_preprocess.unsqueeze(0)).squeeze(0)
             result['preprocessed'] = preprocessed_tensor
             
         return result
@@ -94,7 +103,7 @@ def create_dataloaders(config_data):
         train_dataset,
         batch_size=config_data['batch_size'],
         shuffle=True,
-        num_workers=config_data.get('num_workers', 2), # Add default value
+        num_workers=config_data.get('num_workers', 2),
         pin_memory=True
     )
     val_loader = DataLoader(

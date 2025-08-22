@@ -1,14 +1,13 @@
 """
 Training script for Underwater Image Enhancement Diffusion Model
 """
-import os
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
-from pathlib import Path  # 👈 [수정] 누락된 Path import 추가
+from pathlib import Path  # 👈 [수정 완료] 누락된 Path import 추가
 
-# 👈 [수정] import 경로를 패키지 레벨로 명확화
+# 👈 [수정 완료] import 경로를 패키지 레벨로 명확화
 from models.main_model import create_model 
 from data.dataset import create_dataloaders
 from config import get_config
@@ -42,7 +41,7 @@ class Trainer:
     def train_epoch(self):
         self.model.train()
         meter = AverageMeter()
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+        pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch + 1}/{self.config['training']['num_epochs']}")
 
         for batch in pbar:
             degraded = batch['degraded'].to(self.device)
@@ -70,7 +69,7 @@ class Trainer:
         val_meter = AverageMeter()
         print("\nConducting validation...")
         
-        # 👇 [수정] 실제 검증 로직으로 완성
+        # 👇 [수정 완료] 실제 검증 로직으로 완성
         for batch in tqdm(self.val_loader, desc="Validation"):
             degraded = batch['degraded'].to(self.device)
             enhanced = batch['enhanced'].to(self.device)
@@ -96,8 +95,13 @@ class Trainer:
         enhanced_gt = batch['enhanced'][:4].to(self.device)
         pred_enhanced = self.model.sample(degraded)
 
-        save_path = self.sample_dir / f'epoch_{self.epoch}.png'
-        save_images(degraded, enhanced_gt, pred_enhanced, save_path)
+        # Denormalize to [0, 1] for saving
+        degraded = torch.clamp((degraded + 1.0) / 2.0, 0, 1)
+        enhanced_gt = torch.clamp((enhanced_gt + 1.0) / 2.0, 0, 1)
+        pred_enhanced = torch.clamp((pred_enhanced + 1.0) / 2.0, 0, 1)
+
+        save_path = self.sample_dir / f'epoch_{self.epoch + 1}.png'
+        save_images(degraded, enhanced_gt, pred_enhanced, save_path, normalize=False)
         print(f"Saved sample images to {save_path}")
 
     def train(self):
@@ -105,11 +109,11 @@ class Trainer:
             self.epoch = epoch
             self.train_epoch()
 
-            if epoch % self.config['training']['val_freq'] == 0:
+            if (epoch + 1) % self.config['training']['val_freq'] == 0:
                 self.validate()
 
-            if epoch % self.config['training']['save_freq'] == 0:
-                save_checkpoint(self.model.state_dict(), self.checkpoint_dir, f'epoch_{epoch}.pth')
+            if (epoch + 1) % self.config['training']['save_freq'] == 0:
+                save_checkpoint(self.model.state_dict(), self.checkpoint_dir, f'epoch_{epoch+1}.pth')
 
 def main():
     parser = argparse.ArgumentParser()

@@ -1,0 +1,43 @@
+# Core deep learning frameworks
+torch>=1.12.0
+torchvision>=0.13.0
+torchaudio>=0.12.0
+
+# Computer vision and image processing
+opencv-python>=4.6.0
+Pillow>=9.0.0
+scikit-image>=0.19.0
+imageio>=2.19.0
+
+# Data manipulation and utilities
+numpy>=1.21.0
+pandas>=1.4.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Configuration and logging
+PyYAML>=6.0
+tensorboard>=2.8.0
+wandb>=0.12.0
+tqdm>=4.64.0
+
+# Additional ML utilities
+einops>=0.4.0
+timm>=0.6.0
+lpips>=0.1.4
+
+# Image quality metrics
+pytorch-fid>=0.3.0
+torch-fidelity>=0.3.0
+
+# Development and testing
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
+pre-commit>=2.17.0
+
+# Optional: For advanced features
+# albumentations>=1.2.0  # Advanced data augmentation
+# kornia>=0.6.0          # Differentiable computer vision
+# hydra-core>=1.2.0      # Advanced configuration management
+# lightning>=1.6.0       # PyTorch Lightning for easier training

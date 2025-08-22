@@ -1,0 +1,43 @@
+data:
+  augment: true
+  batch_size: 8
+  data_root: ./DATA
+  dataset_type: LSUI
+  img_size: 256
+  num_workers: 4
+  preprocessing_type: waternet
+device: cuda
+exp_dir: experiments/underwater_diffusion_v1
+exp_name: underwater_diffusion_lsui
+logging:
+  log_dir: logs
+  use_wandb: false
+  wandb_project: underwater-enhancement
+loss:
+  adversarial_weight: 0.1
+  structure_weight: 1.0
+  underwater_weight: 0.5
+  use_adversarial: false
+model:
+  base_channels: 128
+  img_size: 256
+  in_channels: 3
+  latent_channels: 4
+  physics_dim: 128
+  time_steps: 1000
+seed: 42
+testing:
+  eta: 0.0
+  num_steps: 50
+  use_ddim: true
+training:
+  diffusion_lr: 0.0001
+  grad_clip: 1.0
+  log_freq: 100
+  max_val_batches: 50
+  min_lr: 1.0e-06
+  num_epochs: 300
+  save_freq: 10
+  vae_lr: 0.0001
+  val_freq: 1000
+  weight_decay: 1.0e-05

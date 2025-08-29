@@ -11,7 +11,6 @@ import math
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 import random
-import os # <--- Added this line
 
 # denoising-diffusion-pytorch 라이브러리의 Unet, GaussianDiffusion 클래스를 가져옵니다.
 from denoising_diffusion_pytorch import Unet, GaussianDiffusion
@@ -28,7 +27,7 @@ def default(val, d):
     return d() if callable(d) else d
 
 # ==============================================================================
-# 1. 데이터셋 클래스 (ColorJitter 제외)
+# 1. 데이터셋 클래스
 # ==============================================================================
 class UIEBPairedDataset(Dataset):
     def __init__(self, raw_folder, reference_folder, image_size, split='train', train_ratio=0.8, random_seed=42):
@@ -41,7 +40,6 @@ class UIEBPairedDataset(Dataset):
         
         assert len(all_raw_paths) == len(all_ref_paths), "Raw and reference image counts mismatch"
         
-        # Train/Validation 분할
         random.seed(random_seed)
         indices = list(range(len(all_raw_paths)))
         random.shuffle(indices)
@@ -53,7 +51,6 @@ class UIEBPairedDataset(Dataset):
 
         print(f"Loaded {split.upper()} dataset: {len(self.indices)} images")
         
-        # Color Augmentation 제외
         if split == 'train':
             self.transform = T.Compose([
                 T.Resize((image_size, image_size)),
@@ -74,11 +71,10 @@ class UIEBPairedDataset(Dataset):
     def __getitem__(self, idx):
         raw_img = Image.open(self.raw_paths[idx]).convert('RGB')
         ref_img = Image.open(self.ref_paths[idx]).convert('RGB')
-        
         return self.transform(raw_img), self.transform(ref_img)
 
 # ==============================================================================
-# 2. 수정된 모델 및 Diffusion 클래스
+# 2. 모델 및 Diffusion 클래스
 # ==============================================================================
 class ConditionalUnet(nn.Module):
     def __init__(self, dim=64, dim_mults=(1, 2, 4, 8)):
@@ -106,8 +102,7 @@ class ConditionalGaussianDiffusion(GaussianDiffusion):
         pred_noise = self.model(x_noisy, t, condition)
         
         if self.objective != 'pred_noise':
-                raise ValueError('Objective must be pred_noise for this implementation')
-
+             raise ValueError('Objective must be pred_noise for this implementation')
         return F.mse_loss(pred_noise, noise)
 
     def forward(self, clean_imgs, raw_imgs):
@@ -116,77 +111,68 @@ class ConditionalGaussianDiffusion(GaussianDiffusion):
         return self.p_losses(clean_imgs, t, condition=raw_imgs)
 
     @torch.no_grad()
-    def sample_conditional(self, condition):
+    def sample_conditional(self, condition, start_timestep=None):
         batch_size = condition.shape[0]
-        image_size = self.image_size # 이제 tuple (H, W)가 됩니다.
-        shape = (batch_size, self.channels, image_size[0], image_size[1])
+        device = self.betas.device
+        start_timestep = default(start_timestep, self.num_timesteps - 1)
         
-        total_timesteps, sampling_timesteps, eta, device = self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.betas.device
-        
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))
-        
-        img = torch.randn(shape, device = device)
-        
-        for time, time_next in tqdm(time_pairs, desc='Sampling', leave=False):
-            time_cond = torch.full((batch_size,), time, device=device, dtype=torch.long)
-            
-            pred_noise = self.model(img, time_cond, condition)
-            x_start = self.predict_start_from_noise(img, time_cond, pred_noise)
+        # 입력 이미지에 노이즈를 추가하여 샘플링 시작점으로 사용
+        t = torch.full((batch_size,), start_timestep, device=device, dtype=torch.long)
+        img = self.q_sample(x_start=condition, t=t)
 
+        for i in tqdm(reversed(range(0, start_timestep)), desc='Sampling', leave=False):
+            times = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            pred_noise = self.model(img, times, condition)
+            
+            x_start = self.predict_start_from_noise(img, times, pred_noise)
             if hasattr(self, 'clip_denoised') and self.clip_denoised:
-                    x_start.clamp_(-1., 1.)
+                 x_start.clamp_(-1., 1.)
 
-            if time_next < 0:
-                img = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
+            model_mean, _, _ = self.q_posterior(x_start=x_start, x_t=img, t=times)
             
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
+            noise = torch.randn_like(img) if i > 0 else 0.
             
-            noise = torch.randn_like(img) if time > 0 else 0.
-            img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+            posterior_variance = self._get_variance(times)
+            img = model_mean + torch.sqrt(posterior_variance) * noise
             
         return self.unnormalize(img)
+    
+    def _get_variance(self, t):
+        # DDPM의 posterior variance를 사용
+        alpha_t = self.alphas_cumprod[t]
+        alpha_t_prev = self.alphas_cumprod[t-1] if t[0] > 0 else torch.tensor(1.0)
+        
+        # DDPM 논문의 Equation 7
+        posterior_variance = self.betas[t] * (1. - alpha_t_prev) / (1. - alpha_t)
+        return posterior_variance.reshape(-1, 1, 1, 1)
 
 # ==============================================================================
 # 3. 평가 및 시각화 헬퍼 함수
 # ==============================================================================
 def calculate_psnr(img1, img2):
-    # img1, img2는 [0, 1] 범위의 torch tensor로 가정
     mse = F.mse_loss(img1, img2)
-    if mse == 0:
-        return float('inf')
+    if mse == 0: return float('inf')
     return 20 * math.log10(1.0 / math.sqrt(mse.item()))
 
 def unnormalize_image(tensor):
     return (tensor.clamp(-1., 1.) + 1.0) / 2.0
 
-# VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV
-# This is the modified section
-# VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV
-def visualize_and_evaluate(diffusion_model, dataloader, device, epoch, num_samples=2, save_dir='./results'):
-    # Create the save directory if it doesn't exist
-    os.makedirs(save_dir, exist_ok=True)
-    
+def visualize_and_evaluate(diffusion_model, dataloader, device, epoch, save_folder="results", num_samples=2, start_timestep=500):
     diffusion_model.eval()
+    save_folder = Path(save_folder)
+    save_folder.mkdir(exist_ok=True)
+    
     raw_imgs, ref_imgs = next(iter(dataloader))
     raw_imgs = raw_imgs[:num_samples].to(device)
     ref_imgs = ref_imgs[:num_samples].to(device)
 
     with torch.no_grad():
-        generated_imgs = diffusion_model.sample_conditional(raw_imgs)
+        generated_imgs = diffusion_model.sample_conditional(raw_imgs, start_timestep=start_timestep)
 
     raw_unnorm = unnormalize_image(raw_imgs)
     ref_unnorm = unnormalize_image(ref_imgs)
     
     psnr_scores = [calculate_psnr(gen, ref) for gen, ref in zip(generated_imgs, ref_unnorm)]
-    
-    # .item() 호출 제거
     avg_psnr = np.mean(psnr_scores)
     
     print(f"\nEpoch {epoch} Evaluation - Average PSNR: {avg_psnr:.2f} dB")
@@ -194,23 +180,14 @@ def visualize_and_evaluate(diffusion_model, dataloader, device, epoch, num_sampl
     all_images = [img.cpu() for pair in zip(raw_unnorm, generated_imgs, ref_unnorm) for img in pair]
     grid = make_grid(all_images, nrow=3, padding=5)
     
-    plt.figure(figsize=(12, num_samples * 4))
-    plt.imshow(grid.permute(1, 2, 0))
-    plt.title(f"Epoch {epoch} | Avg PSNR: {avg_psnr:.2f} dB\n(Raw - Generated - Reference)", fontsize=16)
-    plt.axis('off')
-    
-    # Save the figure to a file instead of showing it
-    save_path = os.path.join(save_dir, f'epoch_{epoch}_evaluation.png')
-    plt.savefig(save_path)
-    print(f"✓ Evaluation image saved to {save_path}")
-    
-    # Close the plot to free up memory
-    plt.close()
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-# End of modified section
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    save_path = save_folder / f"epoch_{epoch}_psnr_{avg_psnr:.2f}.png"
+    T.ToPILImage()(grid).save(save_path)
+    print(f"Evaluation image saved to: {save_path}")
 
-def plot_loss_history(train_losses, val_losses):
+def plot_loss_history(train_losses, val_losses, save_folder="results"):
+    save_folder = Path(save_folder)
+    save_folder.mkdir(exist_ok=True)
+    
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -219,7 +196,11 @@ def plot_loss_history(train_losses, val_losses):
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
-    plt.show()
+    
+    save_path = save_folder / "loss_history.png"
+    plt.savefig(save_path)
+    print(f"Loss history plot saved to: {save_path}")
+    plt.close()
 
 # ==============================================================================
 # 4. 메인 훈련 스크립트
@@ -231,6 +212,7 @@ def main():
     GRAD_ACCUM_EVERY = 8
     NUM_EPOCHS = 50
     LEARNING_RATE = 1e-4
+    EVAL_START_TIMESTEP = 500 # 샘플링 시작 타임스텝
 
     # --- 경로 설정 ---
     RAW_DATA_FOLDER = './data/UIEB/raw'
@@ -249,7 +231,7 @@ def main():
     # --- 모델 및 Diffusion 설정 ---
     model = ConditionalUnet(dim=64, dim_mults=(1, 2, 4, 8))
     diffusion = ConditionalGaussianDiffusion(
-        model, image_size=IMAGE_SIZE, timesteps=1000,
+        model, image_size=(IMAGE_SIZE, IMAGE_SIZE), timesteps=1000,
         objective='pred_noise', beta_schedule='cosine'
     ).to(device)
     
@@ -265,12 +247,13 @@ def main():
         diffusion.train()
         total_train_loss = 0
         
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=False)
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=True)
         for i, (raw_imgs, clean_imgs) in enumerate(progress_bar):
             raw_imgs, clean_imgs = raw_imgs.to(device), clean_imgs.to(device)
             
-            loss = diffusion(clean_imgs, raw_imgs)
-            loss = loss / GRAD_ACCUM_EVERY
+            with torch.cuda.amp.autocast():
+                loss = diffusion(clean_imgs, raw_imgs)
+                loss = loss / GRAD_ACCUM_EVERY
             
             loss.backward()
             total_train_loss += loss.item()
@@ -290,7 +273,8 @@ def main():
         with torch.no_grad():
             for raw_imgs, clean_imgs in val_dataloader:
                 raw_imgs, clean_imgs = raw_imgs.to(device), clean_imgs.to(device)
-                val_loss = diffusion(clean_imgs, raw_imgs)
+                with torch.cuda.amp.autocast():
+                    val_loss = diffusion(clean_imgs, raw_imgs)
                 total_val_loss += val_loss.item()
         
         avg_val_loss = total_val_loss / len(val_dataloader)
@@ -305,7 +289,7 @@ def main():
 
         # --- 10 에포크마다 평가 및 시각화 ---
         if (epoch + 1) % 10 == 0:
-            visualize_and_evaluate(diffusion, val_dataloader, device, epoch + 1)
+            visualize_and_evaluate(diffusion, val_dataloader, device, epoch + 1, start_timestep=EVAL_START_TIMESTEP)
 
     print("\nTraining finished!")
     plot_loss_history(train_loss_history, val_loss_history)

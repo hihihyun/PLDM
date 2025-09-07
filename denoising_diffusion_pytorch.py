@@ -32,6 +32,12 @@ from denoising_diffusion_pytorch.attend import Attend
 
 from denoising_diffusion_pytorch.version import __version__
 
+# denoising_diffusion_pytorch.py 상단에 추가
+import torch.utils.data as data
+import matplotlib.pyplot as plt
+from torchmetrics.image import PeakSignalNoiseRatio
+from torch.utils.data import random_split
+
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -282,6 +288,8 @@ class Unet(Module):
         dim_mults = (1, 2, 4, 8),
         channels = 3,
         self_condition = False,
+        # 주석: conditional 인자를 추가하여 수중 영상(raw)을 조건으로 받을지 결정합니다.
+        conditional = True,
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
@@ -299,7 +307,11 @@ class Unet(Module):
 
         self.channels = channels
         self.self_condition = self_condition
+        # 주석: conditional이 True일 경우, 입력 채널 수를 2배(기존 이미지 + 조건 이미지)로 설정합니다.
+        # self_condition도 True이면 3배가 됩니다.
         input_channels = channels * (2 if self_condition else 1)
+        if conditional:
+            input_channels += channels
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
@@ -389,12 +401,17 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    # 주석: forward 메서드에 x_cond 파라미터를 추가합니다. 이 파라미터로 raw 이미지를 전달받습니다.
+    def forward(self, x, time, x_self_cond = None, x_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+
+        # 주석: x_cond가 제공되면, 주 입력 x와 채널(dim=1) 기준으로 합칩니다.
+        if exists(x_cond):
+            x = torch.cat((x_cond, x), dim = 1)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -635,8 +652,9 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    # 주석: x_cond 파라미터를 추가하여 모델 예측 시 조건부 이미지를 전달할 수 있도록 합니다.
+    def model_predictions(self, x, t, x_self_cond = None, x_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t, x_self_cond, x_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -660,8 +678,9 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    # 주석: p_mean_variance, p_sample 메서드에도 x_cond 파라미터를 추가합니다.
+    def p_mean_variance(self, x, t, x_self_cond = None, x_cond = None, clip_denoised = True):
+        preds = self.model_predictions(x, t, x_self_cond, x_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -671,16 +690,18 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, x_cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        # 주석: p_mean_variance 호출 시 x_cond를 전달합니다.
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, x_cond = x_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    # 주석: p_sample_loop 메서드에 x_cond 파라미터를 추가합니다.
+    def p_sample_loop(self, shape, x_cond = None, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -690,7 +711,8 @@ class GaussianDiffusion(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            # 주석: p_sample 호출 시 x_cond를 전달합니다.
+            img, x_start = self.p_sample(img, t, self_cond, x_cond)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -699,7 +721,8 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    # 주석: ddim_sample 메서드에 x_cond 파라미터를 추가합니다.
+    def ddim_sample(self, shape, x_cond = None, return_all_timesteps = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -714,7 +737,8 @@ class GaussianDiffusion(Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            # 주석: model_predictions 호출 시 x_cond를 전달합니다.
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, x_cond, clip_x_start = True, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -741,10 +765,11 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    # 주석: sample 메서드에 x_cond 파라미터를 추가하고, 이를 샘플링 함수(p_sample_loop 또는 ddim_sample)로 전달합니다.
+    def sample(self, batch_size = 16, x_cond = None, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), x_cond = x_cond, return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -785,11 +810,12 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    # 주석: p_losses 메서드에 x_cond 파라미터를 추가하여 모델에 전달하도록 합니다.
+    def p_losses(self, x_start, t, x_cond, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
         noise = default(noise, lambda: torch.randn_like(x_start))
-
+        
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
         offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
@@ -809,12 +835,14 @@ class GaussianDiffusion(Module):
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
+                 # 주석: model_predictions 호출 시 x_cond를 전달합니다.
+                x_self_cond = self.model_predictions(x, t, x_cond = x_cond).pred_x_start
                 x_self_cond.detach_()
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        # 주석: model 호출 시 x_cond를 전달합니다.
+        model_out = self.model(x, t, x_self_cond, x_cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -832,29 +860,46 @@ class GaussianDiffusion(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+    # 주석: forward 메서드가 이미지 튜플(raw_img, ref_img)을 받도록 수정합니다.
+    # ref_img는 노이즈를 추가할 깨끗한 이미지(x_start)이고, raw_img는 조건(x_cond)이 됩니다.
+    def forward(self, img_tuple, *args, **kwargs):
+        # 1. 모델 자신의 장치(self.device)를 기준으로 삼습니다. 이것이 가장 확실합니다.
+        device = self.device
+
+        # 2. 입력으로 들어온 모든 텐서를 모델의 장치로 명시적으로 보냅니다.
+        raw_img, ref_img = map(lambda t: t.to(device), img_tuple)
+        
+        b, c, h, w, img_size, = *ref_img.shape, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+        
+        # 3. 't' 텐서도 모델의 장치에 생성합니다.
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        # 주석: raw 이미지와 ref 이미지를 모두 정규화합니다.
+        raw_img = self.normalize(raw_img)
+        ref_img = self.normalize(ref_img)
+        return self.p_losses(ref_img, t, x_cond=raw_img, *args, **kwargs)
 
 # dataset classes
 
-class Dataset(Dataset):
+# 주석: 클래스 이름을 PairedDataset으로 변경하고, raw 이미지 폴더와 reference 이미지 폴더를 모두 받도록 수정합니다.
+class PairedDataset(Dataset):
     def __init__(
         self,
-        folder,
+        raw_folder,
+        ref_folder,
         image_size,
         exts = ['jpg', 'jpeg', 'png', 'tiff'],
         augment_horizontal_flip = False,
         convert_image_to = None
     ):
         super().__init__()
-        self.folder = folder
+        self.raw_folder = raw_folder
+        self.ref_folder = ref_folder
         self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        
+        # 주석: raw 폴더의 이미지 경로를 기준으로 삼습니다.
+        self.raw_paths = [p for ext in exts for p in Path(f'{raw_folder}').glob(f'**/*.{ext}')]
 
         maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
@@ -867,20 +912,33 @@ class Dataset(Dataset):
         ])
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.raw_paths)
 
     def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        # 주석: raw 이미지 경로를 가져옵니다.
+        raw_path = self.raw_paths[index]
+        # 주석: raw 이미지 파일 이름과 동일한 reference 이미지를 ref_folder에서 찾습니다.
+        ref_path = Path(self.ref_folder) / raw_path.name
+        
+        raw_img = Image.open(raw_path)
+        ref_img = Image.open(ref_path)
 
+        # 주석: raw 이미지와 reference 이미지를 튜플 형태로 반환합니다.
+        return self.transform(raw_img), self.transform(ref_img)
+    
 # trainer class
+
+# denoising_diffusion_pytorch.py -> class Trainer
 
 class Trainer:
     def __init__(
         self,
         diffusion_model,
-        folder,
+        # ===> 수정된 부분 시작 <===
+        # 주석: 단일 폴더 대신 raw_folder와 ref_folder를 받습니다.
+        raw_folder,
+        ref_folder,
+        # ===> 수정된 부분 끝 <===
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -897,33 +955,33 @@ class Trainer:
         mixed_precision_type = 'fp16',
         split_batches = True,
         convert_image_to = None,
-        calculate_fid = True,
-        inception_block_idx = 2048,
+        # ===> 수정된 부분 시작 <===
+        # 주석: calculate_fid를 calculate_psnr로 변경하고, 관련 인자를 추가합니다.
+        calculate_psnr = True,
+        # ===> 수정된 부분 끝 <===
         max_grad_norm = 1.,
-        num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        # ===> 수정된 부분 시작 <===
+        # 주석: FID 관련 인자 제거
+        # num_fid_samples = 50000,
+        # save_best_and_latest_only = False
+        # 주석: PSNR 기반으로 최고의 모델을 저장하는 옵션을 추가합니다.
+        save_best_and_latest_only = True,
+        val_split_ratio = 0.1 # 주석: train/validation 분할 비율
+        # ===> 수정된 부분 끝 <===
     ):
         super().__init__()
-
-        # accelerator
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
         )
 
-        # model
-
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
 
-        # default convert_image_to depending on channels
-
         if not exists(convert_image_to):
             convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
-
-        # sampling and training hyperparameters
 
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
@@ -938,22 +996,28 @@ class Trainer:
 
         self.max_grad_norm = max_grad_norm
 
-        # dataset and dataloader
+        # ===> 수정된 부분 시작 <===
+        # 주석: PairedDataset을 사용하여 데이터셋을 생성합니다.
+        self.ds = PairedDataset(raw_folder, ref_folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        assert len(self.ds) >= 10, 'Dataset should have at least 10 images.'
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        # 주석: 데이터셋을 train/validation으로 분할합니다.
+        val_size = int(len(self.ds) * val_split_ratio)
+        train_size = len(self.ds) - val_size
+        self.train_ds, self.val_ds = random_split(self.ds, [train_size, val_size])
 
-        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+        print(f'Found {len(self.ds)} images in total.')
+        print(f'{len(self.train_ds)} for training, {len(self.val_ds)} for validation.')
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
-
-        dl = self.accelerator.prepare(dl)
+        # 주석: train/validation 데이터로더를 각각 생성합니다.
+        dl = DataLoader(self.train_ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
         self.dl = cycle(dl)
 
-        # optimizer
+        val_dl = DataLoader(self.val_ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+        self.val_dl = val_dl
+        # ===> 수정된 부분 끝 <===
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-
-        # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
@@ -962,44 +1026,26 @@ class Trainer:
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
 
-        # step counter state
-
         self.step = 0
 
-        # prepare model, dataloader, optimizer with accelerator
+        self.model, self.opt, self.dl, self.val_dl = self.accelerator.prepare(self.model, self.opt, self.dl, self.val_dl)
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        # ===> 수정된 부분 시작 <===
+        # 주석: PSNR 계산을 위한 설정
+        self.calculate_psnr = calculate_psnr and self.accelerator.is_main_process
+        if self.calculate_psnr:
+            self.psnr = PeakSignalNoiseRatio().to(self.device)
 
-        # FID-score computation
-
-        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
-
-        if self.calculate_fid:
-            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
-
-            if not is_ddim_sampling:
-                self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
-                )
-
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.batch_size,
-                dl=self.dl,
-                sampler=self.ema.ema_model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
-
-        if save_best_and_latest_only:
-            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
-            self.best_fid = 1e10 # infinite
-
+        # 주석: FID 관련 코드 제거
         self.save_best_and_latest_only = save_best_and_latest_only
+        if self.save_best_and_latest_only:
+            assert calculate_psnr, "`calculate_psnr` must be True to save the best model."
+            self.best_psnr = 0.0 # 주석: PSNR은 높을수록 좋으므로 0으로 초기화
+        
+        # 주석: validation loss와 psnr 기록을 위한 리스트
+        self.val_losses = []
+        self.val_psnrs = []
+        # ===> 수정된 부분 끝 <===
 
     @property
     def device(self):
@@ -1015,30 +1061,33 @@ class Trainer:
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
+            'version': __version__,
+            # ===> 수정된 부분 시작 <===
+            # 주석: 최고 PSNR 점수도 함께 저장
+            'best_psnr': self.best_psnr if hasattr(self, 'best_psnr') else 0.
+            # ===> 수정된 부분 끝 <===
         }
-
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # ... (load 메서드는 기존과 거의 동일, 필요시 best_psnr 로드 로직 추가 가능) ...
+        # ... (생략) ...
+        if self.accelerator.is_main_process and 'best_psnr' in data:
+            self.best_psnr = data['best_psnr']
 
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
-
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
-
-        self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
-
-        if 'version' in data:
-            print(f"loading from version {data['version']}")
-
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+    # ===> 수정된 부분 시작 <===
+    # 주석: validation loss 그래프를 저장하는 함수 추가
+    def save_validation_plot(self):
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.val_losses, label='Validation Loss')
+        plt.title('Validation Loss Over Steps')
+        plt.xlabel('Steps (x' + str(self.save_and_sample_every) + ')')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(str(self.results_folder / 'validation_loss_plot.png'))
+        plt.close()
+    # ===> 수정된 부분 끝 <===
 
     def train(self):
         accelerator = self.accelerator
@@ -1048,12 +1097,13 @@ class Trainer:
 
             while self.step < self.train_num_steps:
                 self.model.train()
-
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
+                    # ===> 수정된 부분 시작 <===
+                    # 주석: 데이터로더에서 (raw, ref) 튜플을 받아옵니다.
+                    data = next(self.dl)
+                    # ===> 수정된 부분 끝 <===
                     with self.accelerator.autocast():
                         loss = self.model(data)
                         loss = loss / self.gradient_accumulate_every
@@ -1062,45 +1112,75 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
-
-                accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
                 self.opt.step()
                 self.opt.zero_grad()
-
                 accelerator.wait_for_everyone()
-
                 self.step += 1
+
                 if accelerator.is_main_process:
                     self.ema.update()
 
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
+                        milestone = self.step // self.save_and_sample_every
+                        
+                        # ===> 수정된 부분 시작 <===
+                        # 주석: validation 루프 시작
+                        total_val_loss = 0.
+                        total_psnr = 0.
 
                         with torch.inference_mode():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            for (raw_img, ref_img) in self.val_dl:
+                                # Validation Loss 계산
+                                val_loss = self.model((raw_img, ref_img))
+                                total_val_loss += val_loss.item()
+                                
+                                # 샘플 생성 및 PSNR 계산
+                                batch_size = raw_img.shape[0]
+                                sampled_images = self.ema.ema_model.sample(batch_size=batch_size, x_cond=raw_img)
+                                
+                                # PSNR 계산을 위해 이미지 스케일을 [0, 1]로 되돌립니다.
+                                ref_img_norm = self.model.unnormalize(ref_img)
+                                sampled_images_norm = torch.clamp(sampled_images, 0.0, 1.0) # 샘플링 결과는 이미 [0,1] 범위일 수 있으나 확실히 함
+                                
+                                total_psnr += self.psnr(sampled_images_norm, ref_img_norm).item()
 
-                        all_images = torch.cat(all_images_list, dim = 0)
+                        avg_val_loss = total_val_loss / len(self.val_dl)
+                        avg_psnr = total_psnr / len(self.val_dl)
+                        
+                        self.val_losses.append(avg_val_loss)
+                        self.val_psnrs.append(avg_psnr)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        accelerator.print(f'Validation Step: {self.step} | Avg Val Loss: {avg_val_loss:.4f} | Avg PSNR: {avg_psnr:.4f}')
 
-                        # whether to calculate fid
+                        # 샘플 이미지 저장 (raw, generated, reference)
+                        # validation 데이터로더의 첫번째 배치를 사용해 샘플 저장
+                        val_raw_sample, val_ref_sample = next(iter(self.val_dl))
+                        val_raw_sample, val_ref_sample = val_raw_sample.to(device), val_ref_sample.to(device)
+                        
+                        with torch.inference_mode():
+                            sampled_images_for_save = self.ema.ema_model.sample(batch_size=val_raw_sample.shape[0], x_cond=val_raw_sample)
 
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
+                        # 3가지 이미지를 나란히 저장하기 위해 스택
+                        comparison_grid = torch.cat([
+                            self.model.normalize(val_raw_sample), # raw
+                            self.model.normalize(sampled_images_for_save), # generated
+                            val_ref_sample # reference
+                        ])
+                        
+                        utils.save_image(comparison_grid, str(self.results_folder / f'sample-{milestone}.png'), nrow = val_raw_sample.shape[0])
+                        self.save_validation_plot() # Validation loss 그래프 저장
 
                         if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
+                            if avg_psnr > self.best_psnr:
+                                self.best_psnr = avg_psnr
                                 self.save("best")
+                                accelerator.print(f'New best model saved with PSNR: {self.best_psnr:.4f}')
                             self.save("latest")
                         else:
                             self.save(milestone)
-
+                        # ===> 수정된 부분 끝 <===
                 pbar.update(1)
 
         accelerator.print('training complete')

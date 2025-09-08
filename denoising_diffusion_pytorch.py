@@ -966,7 +966,8 @@ class Trainer:
         # save_best_and_latest_only = False
         # 주석: PSNR 기반으로 최고의 모델을 저장하는 옵션을 추가합니다.
         save_best_and_latest_only = True,
-        val_split_ratio = 0.1 # 주석: train/validation 분할 비율
+        val_split_ratio = 0.1, # 주석: train/validation 분할 비율
+        early_stopping_patience = 10 # 조기 종료를 위한 patience
         # ===> 수정된 부분 끝 <===
     ):
         super().__init__()
@@ -1045,6 +1046,9 @@ class Trainer:
         # 주석: validation loss와 psnr 기록을 위한 리스트
         self.val_losses = []
         self.val_psnrs = []
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_counter = 0
+        self.best_val_loss = float('inf') # 최고 validation loss를 기록 (낮을수록 좋음)
         # ===> 수정된 부분 끝 <===
 
     @property
@@ -1180,6 +1184,21 @@ class Trainer:
                             self.save("latest")
                         else:
                             self.save(milestone)
+                        
+                        # Early Stopping 로직
+                        if avg_val_loss < self.best_val_loss:
+                            self.best_val_loss = avg_val_loss
+                            self.early_stopping_counter = 0
+                            accelerator.print(f'New best validation loss: {self.best_val_loss:.4f}')
+                        else:
+                            self.early_stopping_counter += 1
+                            accelerator.print(f'Validation loss did not improve for {self.early_stopping_counter} consecutive checkpoints.')
+
+                        if self.early_stopping_counter >= self.early_stopping_patience:
+                            accelerator.print(f'Early stopping triggered after {self.early_stopping_patience} checkpoints with no improvement.')
+                            break # 훈련 루프 종료
+
+                        
                         # ===> 수정된 부분 끝 <===
                 pbar.update(1)
 

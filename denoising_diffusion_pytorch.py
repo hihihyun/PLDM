@@ -34,6 +34,9 @@ from denoising_diffusion_pytorch.version import __version__
 
 # denoising_diffusion_pytorch.py 상단에 추가
 import torch.utils.data as data
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torchmetrics.image import PeakSignalNoiseRatio
 from torch.utils.data import random_split
@@ -967,7 +970,8 @@ class Trainer:
         # 주석: PSNR 기반으로 최고의 모델을 저장하는 옵션을 추가합니다.
         save_best_and_latest_only = True,
         val_split_ratio = 0.1, # 주석: train/validation 분할 비율
-        early_stopping_patience = 10 # 조기 종료를 위한 patience
+        early_stopping_patience = 10, # 조기 종료를 위한 patience
+        resume_from_checkpoint = False, # 체크포인트에서 재개할지 여부
         # ===> 수정된 부분 끝 <===
     ):
         super().__init__()
@@ -1046,9 +1050,20 @@ class Trainer:
         # 주석: validation loss와 psnr 기록을 위한 리스트
         self.val_losses = []
         self.val_psnrs = []
+        self.train_losses = []
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_counter = 0
         self.best_val_loss = float('inf') # 최고 validation loss를 기록 (낮을수록 좋음)
+
+             # resume_from_checkpoint가 True이면 최신 체크포인트를 로드합니다.
+        if resume_from_checkpoint:
+            checkpoint_path = self.results_folder / 'model-latest.pt'
+            if checkpoint_path.exists():
+                self.accelerator.print(f'Found checkpoint, resuming training from {checkpoint_path}')
+                # 'latest' 마일스톤을 로드합니다.
+                self.load("latest")
+            else:
+                self.accelerator.print('No checkpoint found, starting training from scratch.')
         # ===> 수정된 부분 끝 <===
 
     @property
@@ -1074,22 +1089,50 @@ class Trainer:
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        # ... (load 메서드는 기존과 거의 동일, 필요시 best_psnr 로드 로직 추가 가능) ...
-        # ... (생략) ...
-        if self.accelerator.is_main_process and 'best_psnr' in data:
-            self.best_psnr = data['best_psnr']
+        if not self.accelerator.is_local_main_process:
+            return
+
+        path = self.results_folder / f'model-{milestone}.pt'
+        data = torch.load(str(path), map_location=self.device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data['ema'])
+            if 'best_psnr' in data:
+                self.best_psnr = data['best_psnr']
+            if 'val_losses' in data:
+                self.val_losses = data['val_losses']
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+        self.accelerator.print(f'Resuming training from milestone {milestone} at step {self.step}')
 
     # ===> 수정된 부분 시작 <===
-    # 주석: validation loss 그래프를 저장하는 함수 추가
-    def save_validation_plot(self):
+    # 주석: validation loss와 train loss 그래프를 함께 저장하는 함수로 변경
+    def save_loss_plot(self):
         plt.figure(figsize=(10, 5))
+        
+        # train_losses는 매 스텝마다 기록되므로, validation 주기와 길이를 맞춥니다.
+        # validation 체크포인트 시점의 train loss만 추출합니다.
+        train_losses_at_val_checkpoints = self.train_losses[self.save_and_sample_every - 1::self.save_and_sample_every]
+
+        # train_losses와 val_losses의 길이를 맞춥니다.
+        num_val_points = len(self.val_losses)
+        
+        plt.plot(train_losses_at_val_checkpoints[:num_val_points], label='Train Loss')
         plt.plot(self.val_losses, label='Validation Loss')
-        plt.title('Validation Loss Over Steps')
-        plt.xlabel('Steps (x' + str(self.save_and_sample_every) + ')')
+        plt.title('Train & Validation Loss Over Steps')
+        plt.xlabel('Checkpoint (x' + str(self.save_and_sample_every) + ' steps)')
         plt.ylabel('Loss')
         plt.legend()
         plt.grid(True)
-        plt.savefig(str(self.results_folder / 'validation_loss_plot.png'))
+        plt.savefig(str(self.results_folder / 'loss_plot.png'))
         plt.close()
     # ===> 수정된 부분 끝 <===
 
@@ -1114,6 +1157,9 @@ class Trainer:
                         total_loss += loss.item()
 
                     self.accelerator.backward(loss)
+
+                if accelerator.is_main_process:
+                    self.train_losses.append(total_loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1152,6 +1198,14 @@ class Trainer:
 
                         avg_val_loss = total_val_loss / len(self.val_dl)
                         avg_psnr = total_psnr / len(self.val_dl)
+
+                        current_train_loss = self.train_losses[-1] if self.train_losses else 0.
+                        
+                        self.val_losses.append(avg_val_loss)
+                        self.val_psnrs.append(avg_psnr)
+
+                        # Train loss를 함께 출력합니다.
+                        accelerator.print(f'Step: {self.step} | Train Loss: {current_train_loss:.4f} | Avg Val Loss: {avg_val_loss:.4f} | Avg PSNR: {avg_psnr:.4f}')
                         
                         self.val_losses.append(avg_val_loss)
                         self.val_psnrs.append(avg_psnr)
@@ -1174,7 +1228,7 @@ class Trainer:
                         ])
                         
                         utils.save_image(comparison_grid, str(self.results_folder / f'sample-{milestone}.png'), nrow = val_raw_sample.shape[0])
-                        self.save_validation_plot() # Validation loss 그래프 저장
+                        self.save_loss_plot() # 그래프 저장
 
                         if self.save_best_and_latest_only:
                             if avg_psnr > self.best_psnr:

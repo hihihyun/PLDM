@@ -944,6 +944,7 @@ class Trainer:
         # ===> 수정된 부분 끝 <===
         *,
         train_batch_size = 16,
+        val_batch_size = 16,
         gradient_accumulate_every = 1,
         augment_horizontal_flip = True,
         train_lr = 1e-4,
@@ -1018,7 +1019,7 @@ class Trainer:
         dl = DataLoader(self.train_ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
         self.dl = cycle(dl)
 
-        val_dl = DataLoader(self.val_ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
+        val_dl = DataLoader(self.val_ds, batch_size = val_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
         self.val_dl = val_dl
         # ===> 수정된 부분 끝 <===
 
@@ -1191,10 +1192,9 @@ class Trainer:
                                 sampled_images = self.ema.ema_model.sample(batch_size=batch_size, x_cond=raw_img)
                                 
                                 # PSNR 계산을 위해 이미지 스케일을 [0, 1]로 되돌립니다.
-                                ref_img_norm = self.model.unnormalize(ref_img)
                                 sampled_images_norm = torch.clamp(sampled_images, 0.0, 1.0) # 샘플링 결과는 이미 [0,1] 범위일 수 있으나 확실히 함
                                 
-                                total_psnr += self.psnr(sampled_images_norm, ref_img_norm).item()
+                                total_psnr += self.psnr(sampled_images_norm, ref_img).item()
 
                         avg_val_loss = total_val_loss / len(self.val_dl)
                         avg_psnr = total_psnr / len(self.val_dl)
@@ -1206,10 +1206,7 @@ class Trainer:
 
                         # Train loss를 함께 출력합니다.
                         accelerator.print(f'Step: {self.step} | Train Loss: {current_train_loss:.4f} | Avg Val Loss: {avg_val_loss:.4f} | Avg PSNR: {avg_psnr:.4f}')
-                        
-                        self.val_losses.append(avg_val_loss)
-                        self.val_psnrs.append(avg_psnr)
-
+                                                
                         accelerator.print(f'Validation Step: {self.step} | Avg Val Loss: {avg_val_loss:.4f} | Avg PSNR: {avg_psnr:.4f}')
 
                         # 샘플 이미지 저장 (raw, generated, reference)

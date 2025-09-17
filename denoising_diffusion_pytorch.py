@@ -946,7 +946,7 @@ class Trainer:
         train_batch_size = 16,
         val_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
+        augment_horizontal_flip = False,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -1160,7 +1160,8 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 if accelerator.is_main_process:
-                    self.train_losses.append(total_loss)
+                    avg_train_loss = total_loss / self.gradient_accumulate_every
+                    self.train_losses.append(avg_train_loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)

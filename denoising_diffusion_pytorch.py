@@ -405,7 +405,7 @@ class Unet(Module):
         return 2 ** (len(self.downs) - 1)
 
     # 주석: forward 메서드에 x_cond 파라미터를 추가합니다. 이 파라미터로 raw 이미지를 전달받습니다.
-    def forward(self, x, time, x_self_cond = None, x_cond = None):
+    def forward(self, x, time, x_self_cond = None, x_cond = None, x_uncond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
@@ -511,7 +511,9 @@ class GaussianDiffusion(Module):
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False
+        immiscible = False,
+        p_uncond = 0.1,
+        guidance_scale = 3.
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -521,6 +523,9 @@ class GaussianDiffusion(Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.p_uncond = p_uncond
+        self.guidance_scale = guidance_scale
+
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -817,6 +822,11 @@ class GaussianDiffusion(Module):
     def p_losses(self, x_start, t, x_cond, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
+        # 무작위로 조건을 제거하여 비조건부 학습을 수행합니다.
+        # 각 배치에 대해 독립적으로 확률을 계산합니다.
+        mask = torch.rand(x_cond.shape[0], device=self.device) >= self.p_uncond
+        x_cond = torch.where(mask.reshape(-1, 1, 1, 1), x_cond, torch.zeros_like(x_cond))
+        
         noise = default(noise, lambda: torch.randn_like(x_start))
         
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
@@ -826,6 +836,7 @@ class GaussianDiffusion(Module):
         if offset_noise_strength > 0.:
             offset_noise = torch.randn(x_start.shape[:2], device = self.device)
             noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
+
 
         # noise sample
 

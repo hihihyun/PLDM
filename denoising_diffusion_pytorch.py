@@ -405,7 +405,7 @@ class Unet(Module):
         return 2 ** (len(self.downs) - 1)
 
     # 주석: forward 메서드에 x_cond 파라미터를 추가합니다. 이 파라미터로 raw 이미지를 전달받습니다.
-    def forward(self, x, time, x_self_cond = None, x_cond = None, x_uncond = None):
+    def forward(self, x, time, x_self_cond = None, x_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
@@ -688,12 +688,26 @@ class GaussianDiffusion(Module):
 
     # 주석: p_mean_variance, p_sample 메서드에도 x_cond 파라미터를 추가합니다.
     def p_mean_variance(self, x, t, x_self_cond = None, x_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond, x_cond)
-        x_start = preds.pred_x_start
+        # CFG 로직 시작
+        # 1. 비조건부 예측: x_cond를 0으로 채워서 모델을 호출합니다.
+        null_x_cond = torch.zeros_like(x_cond)
+        null_preds = self.model_predictions(x, t, x_self_cond, null_x_cond)
+        null_pred_noise = null_preds.pred_noise
 
-        if clip_denoised:
-            x_start.clamp_(-1., 1.)
+        # 2. 조건부 예측: 원래의 x_cond로 모델을 호출합니다.
+        cond_preds = self.model_predictions(x, t, x_self_cond, x_cond)
+        cond_pred_noise = cond_preds.pred_noise
 
+        # 3. 비조건부 예측과 조건부 예측을 guidance_scale을 이용해 결합합니다.
+        pred_noise = null_pred_noise + self.guidance_scale * (cond_pred_noise - null_pred_noise)
+        # CFG 로직 끝
+
+        # 4. 결합된 최종 노이즈 예측을 사용하여 x_start를 계산합니다.
+        x_start = self.predict_start_from_noise(x, t, pred_noise)
+        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_denoised else identity
+        x_start = maybe_clip(x_start)
+
+        # 5. 기존 p_mean_variance의 나머지 로직을 그대로 유지합니다.
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 

@@ -511,9 +511,7 @@ class GaussianDiffusion(Module):
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False,
-        p_uncond = 0.1,
-        guidance_scale = 3.
+        immiscible = False
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -523,9 +521,6 @@ class GaussianDiffusion(Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
-        self.p_uncond = p_uncond
-        self.guidance_scale = guidance_scale
-
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -688,26 +683,12 @@ class GaussianDiffusion(Module):
 
     # 주석: p_mean_variance, p_sample 메서드에도 x_cond 파라미터를 추가합니다.
     def p_mean_variance(self, x, t, x_self_cond = None, x_cond = None, clip_denoised = True):
-        # CFG 로직 시작
-        # 1. 비조건부 예측: x_cond를 0으로 채워서 모델을 호출합니다.
-        null_x_cond = torch.zeros_like(x_cond)
-        null_preds = self.model_predictions(x, t, x_self_cond, null_x_cond)
-        null_pred_noise = null_preds.pred_noise
+        preds = self.model_predictions(x, t, x_self_cond, x_cond)
+        x_start = preds.pred_x_start
 
-        # 2. 조건부 예측: 원래의 x_cond로 모델을 호출합니다.
-        cond_preds = self.model_predictions(x, t, x_self_cond, x_cond)
-        cond_pred_noise = cond_preds.pred_noise
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
 
-        # 3. 비조건부 예측과 조건부 예측을 guidance_scale을 이용해 결합합니다.
-        pred_noise = null_pred_noise + self.guidance_scale * (cond_pred_noise - null_pred_noise)
-        # CFG 로직 끝
-
-        # 4. 결합된 최종 노이즈 예측을 사용하여 x_start를 계산합니다.
-        x_start = self.predict_start_from_noise(x, t, pred_noise)
-        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_denoised else identity
-        x_start = maybe_clip(x_start)
-
-        # 5. 기존 p_mean_variance의 나머지 로직을 그대로 유지합니다.
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
@@ -836,11 +817,6 @@ class GaussianDiffusion(Module):
     def p_losses(self, x_start, t, x_cond, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
-        # 무작위로 조건을 제거하여 비조건부 학습을 수행합니다.
-        # 각 배치에 대해 독립적으로 확률을 계산합니다.
-        mask = torch.rand(x_cond.shape[0], device=self.device) >= self.p_uncond
-        x_cond = torch.where(mask.reshape(-1, 1, 1, 1), x_cond, torch.zeros_like(x_cond))
-        
         noise = default(noise, lambda: torch.randn_like(x_start))
         
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
@@ -850,7 +826,6 @@ class GaussianDiffusion(Module):
         if offset_noise_strength > 0.:
             offset_noise = torch.randn(x_start.shape[:2], device = self.device)
             noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
-
 
         # noise sample
 

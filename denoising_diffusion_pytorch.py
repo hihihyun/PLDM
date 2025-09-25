@@ -1237,20 +1237,20 @@ class Trainer:
                         else:
                             self.save(milestone)
                         
-                        # Early Stopping 로직
-                        if avg_val_loss < self.best_val_loss:
-                            self.best_val_loss = avg_val_loss
+                        # Early Stopping 로직 (PSNR 기준)
+                        # 이미 best_psnr을 갱신하는 코드가 있으므로, 해당 조건을 활용하여 카운터를 조작합니다.
+                        if avg_psnr > self.best_psnr:
+                          # PSNR이 향상되면 카운터 초기화
                             self.early_stopping_counter = 0
-                            accelerator.print(f'New best validation loss: {self.best_val_loss:.4f}')
                         else:
+                            # PSNR이 향상되지 않으면 카운터 증가
                             self.early_stopping_counter += 1
-                            accelerator.print(f'Validation loss did not improve for {self.early_stopping_counter} consecutive checkpoints.')
+                            accelerator.print(f'PSNR did not improve for {self.early_stopping_counter} consecutive checkpoints.')
 
                         if self.early_stopping_counter >= self.early_stopping_patience:
                             accelerator.print(f'Early stopping triggered after {self.early_stopping_patience} checkpoints with no improvement.')
                             break # 훈련 루프 종료
-
-                        
+                       
                         # ===> 수정된 부분 끝 <===
                 pbar.update(1)
 
